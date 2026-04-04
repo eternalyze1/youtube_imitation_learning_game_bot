@@ -1,2 +1,2 @@
-# youtube_imitation_learning_game_bot
+# YouTube Imitation Learning Game Bot
 Train a game bot on YouTube videos.
