@@ -1,0 +1,13 @@
+import pickle, numpy as np
+actions = pickle.load(open('recorded_data/session_20260404_133108/actions.pkl', 'rb'))
+total = len(actions)
+mv = np.array([a['movement'] for a in actions])
+print(f"Total frames: {total}")
+print(f"W: {mv[:,0].sum():>6.0f} ({mv[:,0].mean()*100:.1f}%)")
+print(f"A: {mv[:,1].sum():>6.0f} ({mv[:,1].mean()*100:.1f}%)")
+print(f"S: {mv[:,2].sum():>6.0f} ({mv[:,2].mean()*100:.1f}%)")
+print(f"D: {mv[:,3].sum():>6.0f} ({mv[:,3].mean()*100:.1f}%)")
+print(f"Attack: {sum(a['attack'] for a in actions)} ({sum(a['attack'] for a in actions)/total*100:.1f}%)")
+print(f"Jump:   {sum(a['jump'] for a in actions)} ({sum(a['jump'] for a in actions)/total*100:.1f}%)")
+print(f"Crouch: {sum(a['crouch'] for a in actions)} ({sum(a['crouch'] for a in actions)/total*100:.1f}%)")
+print(f"Saber:  {sum(a['saber'] for a in actions)} ({sum(a['saber'] for a in actions)/total*100:.1f}%)")
