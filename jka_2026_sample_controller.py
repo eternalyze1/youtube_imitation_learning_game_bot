@@ -246,11 +246,11 @@ if __name__ == "__main__":
             # Periodic recenter
             now = time.time()
             if now - last_recenter_time >= RECENTER_INTERVAL:
-                key_output.HoldKey(key_map['e'])
-                time.sleep(0.1)
-                key_output.ReleaseKey(key_map['e'])
+                # key_output.HoldKey(key_map['e'])
+                # time.sleep(0.1)
+                # key_output.ReleaseKey(key_map['e'])
                 last_recenter_time = now
-                print("  🔄 Recentered view (E)")
+                # print("  🔄 Recentered view (E)")
 
             # FPS reporting
             now = time.time()

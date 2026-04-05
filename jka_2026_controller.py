@@ -15,11 +15,47 @@ import pynput
 from torchvision import models
 
 # ----------------------------------------------------------------------
-# Stateful LSTM Policy Network (optimised for 224x224 input)
+# ConvLSTM cell (2D)
 # ----------------------------------------------------------------------
-class StatefulLSTMPolicy(nn.Module):
-    def __init__(self, lstm_hidden=256, lstm_layers=1):
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_dim, hidden_dim, kernel_size=3, bias=True):
+        super(ConvLSTMCell, self).__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.kernel_size = kernel_size
+        self.padding = kernel_size // 2
+        self.bias = bias
+        self.conv = nn.Conv2d(in_channels=input_dim + hidden_dim,
+                              out_channels=4 * hidden_dim,
+                              kernel_size=kernel_size,
+                              padding=self.padding,
+                              bias=bias)
+
+    def forward(self, x, cur_state):
+        h_cur, c_cur = cur_state
+        combined = torch.cat([x, h_cur], dim=1)  # concatenate along channel axis
+        gates = self.conv(combined)
+        cc_i, cc_f, cc_o, cc_g = torch.split(gates, self.hidden_dim, dim=1)
+        i = torch.sigmoid(cc_i)
+        f = torch.sigmoid(cc_f)
+        o = torch.sigmoid(cc_o)
+        g = torch.tanh(cc_g)
+        c_next = f * c_cur + i * g
+        h_next = o * torch.tanh(c_next)
+        return h_next, c_next
+
+    def init_hidden(self, batch_size, spatial_size, device):
+        height, width = spatial_size
+        return (torch.zeros(batch_size, self.hidden_dim, height, width, device=device),
+                torch.zeros(batch_size, self.hidden_dim, height, width, device=device))
+
+# ----------------------------------------------------------------------
+# Stateful ConvLSTM Policy Network (based on CSGO paper)
+# ----------------------------------------------------------------------
+class StatefulConvLSTMPolicy(nn.Module):
+    def __init__(self, lstm_hidden=128, kernel_size=3):
         super().__init__()
+        # Vision backbone: EfficientNet-B0 (pretrained)
         backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
         self.backbone = backbone.features
         for param in self.backbone.parameters():
@@ -27,44 +63,60 @@ class StatefulLSTMPolicy(nn.Module):
         for param in self.backbone[-3:].parameters():
             param.requires_grad = True
 
-        self.feature_dim = 1280 * 7 * 7
-        self.lstm = nn.LSTM(input_size=self.feature_dim, hidden_size=lstm_hidden,
-                            num_layers=lstm_layers, batch_first=True)
-        self.movement_head = nn.Sequential(nn.Linear(lstm_hidden, 4), nn.Sigmoid())
-        self.attack_head = nn.Sequential(nn.Linear(lstm_hidden, 1), nn.Sigmoid())
-        self.jump_head = nn.Sequential(nn.Linear(lstm_hidden, 1), nn.Sigmoid())
-        self.crouch_head = nn.Sequential(nn.Linear(lstm_hidden, 1), nn.Sigmoid())
-        self.saber_head = nn.Sequential(nn.Linear(lstm_hidden, 1), nn.Sigmoid())
-        self.mouse_x_head = nn.Linear(lstm_hidden, len(mouse_x_possibles))
-        self.mouse_y_head = nn.Linear(lstm_hidden, len(mouse_y_possibles))
+        # EfficientNet outputs (1280, 7, 7) for 224x224 input
+        self.feature_channels = 1280
+        self.feature_h = 7
+        self.feature_w = 7
 
-        self.hidden = None
+        # ConvLSTM layer
+        self.convlstm = ConvLSTMCell(input_dim=self.feature_channels,
+                                     hidden_dim=lstm_hidden,
+                                     kernel_size=kernel_size)
+        self.lstm_hidden = lstm_hidden
+        self.spatial_size = (self.feature_h, self.feature_w)
+
+        # After ConvLSTM, we have (lstm_hidden, 7, 7) -> flatten
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(lstm_hidden * self.feature_h * self.feature_w, 256)
+
+        # Action heads
+        self.movement_head = nn.Sequential(nn.Linear(256, 4), nn.Sigmoid())
+        self.attack_head = nn.Sequential(nn.Linear(256, 1), nn.Sigmoid())
+        self.jump_head = nn.Sequential(nn.Linear(256, 1), nn.Sigmoid())
+        self.crouch_head = nn.Sequential(nn.Linear(256, 1), nn.Sigmoid())
+        self.saber_head = nn.Sequential(nn.Linear(256, 1), nn.Sigmoid())
+        self.mouse_x_head = nn.Linear(256, len(mouse_x_possibles))
+        self.mouse_y_head = nn.Linear(256, len(mouse_y_possibles))
+
+        self.hidden_state = None
 
     def reset_state(self):
-        self.hidden = None
+        self.hidden_state = None
 
     def forward(self, x):
+        # x: (batch, 3, 224, 224)
         batch_size = x.size(0)
-        # x already 224x224
-        features = self.backbone(x)
-        # features = features.view(batch_size, -1).unsqueeze(1)
-        features = features.reshape(batch_size, -1).unsqueeze(1)
-        if self.hidden is None:
-            h0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=x.device)
-            c0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=x.device)
-            self.hidden = (h0, c0)
-        lstm_out, self.hidden = self.lstm(features, self.hidden)
-        last_out = lstm_out[:, -1, :]
-        movement = self.movement_head(last_out)
-        attack = self.attack_head(last_out)
-        jump = self.jump_head(last_out)
-        crouch = self.crouch_head(last_out)
-        saber = self.saber_head(last_out)
-        mouse_x_logits = self.mouse_x_head(last_out)
-        mouse_y_logits = self.mouse_y_head(last_out)
-        mouse_x = torch.softmax(mouse_x_logits, dim=1)
-        mouse_y = torch.softmax(mouse_y_logits, dim=1)
-        return movement, mouse_x, mouse_y, attack, jump, crouch, saber
+        features = self.backbone(x)           # (batch, 1280, 7, 7)
+
+        if self.hidden_state is None:
+            self.hidden_state = self.convlstm.init_hidden(batch_size, self.spatial_size, x.device)
+
+        h, c = self.convlstm(features, self.hidden_state)
+        self.hidden_state = (h, c)            # keep for next frame
+
+        # Flatten and pass through FC
+        out = self.flatten(h)                 # (batch, lstm_hidden * 7 * 7)
+        out = torch.relu(self.fc(out))
+
+        movement = self.movement_head(out)
+        attack = self.attack_head(out)
+        jump = self.jump_head(out)
+        crouch = self.crouch_head(out)
+        saber = self.saber_head(out)
+        mouse_x_logits = self.mouse_x_head(out)
+        mouse_y_logits = self.mouse_y_head(out)
+
+        return movement, mouse_x_logits, mouse_y_logits, attack, jump, crouch, saber
 
 
 if __name__ == "__main__":
@@ -76,7 +128,7 @@ if __name__ == "__main__":
         'd': key_output.d_char,
         'ctrl': key_output.ctrl_char,
         'space': key_output.space_char,
-        'e': key_output.e_char,   # recenter view command
+        'e': key_output.e_char,
     }
 
     current_keys = set()
@@ -84,13 +136,10 @@ if __name__ == "__main__":
     frame_count = 0
     prev_img = None
 
-    # FPS reporting
     fps_last_time = time.time()
     fps_frame_count = 0
-
-    # Recenter timer
     last_recenter_time = time.time()
-    RECENTER_INTERVAL = 0.5  # seconds
+    RECENTER_INTERVAL = 0.5
 
     def on_press(key):
         global quit_flag
@@ -105,6 +154,7 @@ if __name__ == "__main__":
     def execute_actions(movement, mouse_delta_x, mouse_delta_y, attack, jump, crouch, saber):
         global current_keys
 
+        # Deterministic keys (WASD) – argmax (threshold 0.5)
         keys_to_press = set()
         if movement[0] > 0.5: keys_to_press.add('w')
         if movement[1] > 0.5: keys_to_press.add('a')
@@ -118,22 +168,24 @@ if __name__ == "__main__":
             key_output.HoldKey(key_map[key])
         current_keys = keys_to_press
 
+        # Mouse movement: argmax (no sampling)
         win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, int(mouse_delta_x), int(mouse_delta_y), 0, 0)
 
-        if attack > 0.5:
+        # Binary actions: probabilistic (sample) as per paper
+        if np.random.rand() < attack:
             key_output.left_click()
-        if jump > 0.5:
+        if np.random.rand() < jump:
             key_output.right_click()
-        if saber > 0.5:
+        if np.random.rand() < saber:
             key_output.HoldKey(key_map['space'])
             time.sleep(0.05)
             key_output.ReleaseKey(key_map['space'])
 
     # Initialize policy
-    policy = StatefulLSTMPolicy().cuda()
+    policy = StatefulConvLSTMPolicy().cuda()
     try:
-        policy.load_state_dict(torch.load('policy_lstm_trained.pth'))
-        print("✅ Loaded trained policy from policy_lstm_trained.pth")
+        policy.load_state_dict(torch.load('policy_convlstm_trained.pth'))
+        print("✅ Loaded trained policy from policy_convlstm_trained.pth")
     except:
         print("⚠️ No trained weights found, using untrained policy")
     policy.eval()
@@ -150,7 +202,7 @@ if __name__ == "__main__":
     sct = mss.mss()
     model_input_size = (224, 224)
     print(f"Model input size: {model_input_size[0]}x{model_input_size[1]}")
-    print("LSTM state persists indefinitely. Press 'C' to quit.")
+    print("ConvLSTM state persists indefinitely. Press 'C' to quit.")
 
     listener = pynput.keyboard.Listener(on_press=on_press)
     listener.start()
@@ -158,7 +210,6 @@ if __name__ == "__main__":
     input_tensor = torch.zeros(1, 3, model_input_size[0], model_input_size[1], device='cuda')
     frame_buffer = np.zeros((model_input_size[0], model_input_size[1], 3), dtype=np.float32)
 
-    # Warmup
     dummy = torch.randn(1, 3, model_input_size[0], model_input_size[1], device='cuda')
     with torch.no_grad():
         _ = policy(dummy)
@@ -167,7 +218,7 @@ if __name__ == "__main__":
     target_fps = 16
     frame_time = 1.0 / target_fps
 
-    print("\n🎮 Starting game controller at 16 FPS...\n")
+    print("\n🎮 Starting game controller at 16 FPS (ConvLSTM)...\n")
 
     with torch.no_grad():
         while not quit_flag:
@@ -175,7 +226,6 @@ if __name__ == "__main__":
             frame_count += 1
             fps_frame_count += 1
 
-            # Capture window
             left, top, right, bottom = win32gui.GetWindowRect(hwin_csgo)
             monitor = {"left": left, "top": top, "width": right - left, "height": bottom - top}
             img = sct.grab(monitor)
@@ -183,22 +233,20 @@ if __name__ == "__main__":
             img = img[:, :, :3]
             img = cv2.resize(img, model_input_size)
 
-            # Frame difference debugging (every 60 frames)
             if prev_img is not None and frame_count % 60 == 0:
                 diff = np.abs(img.astype(float) - prev_img.astype(float)).mean()
                 print(f"Frame diff: {diff:.2f}")
             prev_img = img.copy()
 
-            # Preprocess and copy to GPU tensor
             np.copyto(frame_buffer, img.astype(np.float32) / 255.0)
             tensor_cpu = torch.from_numpy(frame_buffer).permute(2, 0, 1).unsqueeze(0)
             input_tensor.copy_(tensor_cpu)
 
-            # Forward pass
-            movement, mouse_x, mouse_y, attack, jump, crouch, saber = policy(input_tensor)
+            movement, mouse_x_logits, mouse_y_logits, attack, jump, crouch, saber = policy(input_tensor)
 
-            mouse_x_probs = mouse_x[0].cpu().numpy()
-            mouse_y_probs = mouse_y[0].cpu().numpy()
+            # Argmax for mouse
+            mouse_x_probs = torch.softmax(mouse_x_logits[0], dim=0).cpu().numpy()
+            mouse_y_probs = torch.softmax(mouse_y_logits[0], dim=0).cpu().numpy()
             mouse_x_idx = np.argmax(mouse_x_probs)
             mouse_y_idx = np.argmax(mouse_y_probs)
             mouse_delta_x = mouse_x_possibles[mouse_x_idx]
@@ -227,17 +275,14 @@ if __name__ == "__main__":
                 saber_prob
             )
 
-            # Periodic recenter view (press 'e')
             now = time.time()
             if now - last_recenter_time >= RECENTER_INTERVAL:
-                key_output.HoldKey(key_map['e'])
-                time.sleep(0.1)
-                key_output.ReleaseKey(key_map['e'])
+                # key_output.HoldKey(key_map['e'])
+                # time.sleep(0.1)
+                # key_output.ReleaseKey(key_map['e'])
                 last_recenter_time = now
-                print("  🔄 Recentered view (E)")
+                # print("  🔄 Recentered view (E)")
 
-            # FPS reporting
-            now = time.time()
             if now - fps_last_time >= 1.0:
                 fps = fps_frame_count / (now - fps_last_time)
                 print(f"📊 FPS: {fps:.1f}")
