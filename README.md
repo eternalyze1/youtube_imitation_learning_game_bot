@@ -1,6 +1,13 @@
 # YouTube Imitation Learning Game Bot
 Train a game bot on YouTube videos.
 
+## Update
+We're now training a policy model nearly identical to the one used by CSGO guys (see Credits), also at 16 FPS. My current workflow is:
+
+```data_recorder -> train_idm -> youtube_pipeline -> controller/sample_controller```
+
+data_recorder records the gameplay data needed for the IDM, train_idm trains the IDM, youtube_pipeline trains the policy model on youtube videos labelled with the IDM and controller runs the trained bot for testing. sample_controller is like controller but instead of taking argmax of the probabilities it samples the probabilties. This gives more variety of action. Also there is a temperature parameter, which flattens the probabilities further. So using a high temperature (eg 1000) will result in essentially random gameplay.
+
 ## Concept
 Train an inverse dynamics model (IDM) which predicts the actions (keystrokes and mouse movent) taken from pairs of before and after game images (screenshots). Use the trained IDM to label YouTube videos. Train a policy on the labelled YouTube videos.
 
