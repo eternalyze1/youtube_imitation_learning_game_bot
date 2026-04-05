@@ -257,7 +257,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    session_dir = 'recorded_data/session_20260404_133108'
+    # session_dir = 'recorded_data/session_20260404_133108'
+    session_dir = 'recorded_data/session_20260405_002501'
     print(f"Loading data from {session_dir}...")
     
     frames, actions = load_session_data(session_dir)

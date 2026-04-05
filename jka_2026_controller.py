@@ -47,7 +47,8 @@ class StatefulLSTMPolicy(nn.Module):
         batch_size = x.size(0)
         # x already 224x224
         features = self.backbone(x)
-        features = features.view(batch_size, -1).unsqueeze(1)
+        # features = features.view(batch_size, -1).unsqueeze(1)
+        features = features.reshape(batch_size, -1).unsqueeze(1)
         if self.hidden is None:
             h0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=x.device)
             c0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=x.device)
@@ -89,7 +90,7 @@ if __name__ == "__main__":
 
     # Recenter timer
     last_recenter_time = time.time()
-    RECENTER_INTERVAL = 8.0  # seconds
+    RECENTER_INTERVAL = 0.5  # seconds
 
     def on_press(key):
         global quit_flag
@@ -227,13 +228,13 @@ if __name__ == "__main__":
             )
 
             # Periodic recenter view (press 'e')
-            # now = time.time()
-            # if now - last_recenter_time >= RECENTER_INTERVAL:
-            #     key_output.HoldKey(key_map['e'])
-            #     time.sleep(0.1)
-            #     key_output.ReleaseKey(key_map['e'])
-            #     last_recenter_time = now
-            #     print("  🔄 Recentered view (E)")
+            now = time.time()
+            if now - last_recenter_time >= RECENTER_INTERVAL:
+                key_output.HoldKey(key_map['e'])
+                time.sleep(0.1)
+                key_output.ReleaseKey(key_map['e'])
+                last_recenter_time = now
+                print("  🔄 Recentered view (E)")
 
             # FPS reporting
             now = time.time()
