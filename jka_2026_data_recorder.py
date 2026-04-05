@@ -240,7 +240,7 @@ def playback_event():
 
 
 def main(*argv):
-    global recording, playback
+    global recording, playback, event_count, last_fps_time, frame_dx, frame_dy, bot_frames, bot_actions
     
     wnd_cls = "SO049572093_RawInputWndClass"
     wcx = cws.WNDCLASSEX()
@@ -282,9 +282,6 @@ def main(*argv):
     target_fps = 60
     frame_time = 1.0 / target_fps
     next_frame = time.time() + frame_time
-    
-    global frame_dx, frame_dy
-
     
     while True:
         # Process ALL pending messages to never lose mouse events

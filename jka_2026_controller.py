@@ -12,38 +12,57 @@ from config import csgo_game_res, csgo_img_dimension, mouse_x_possibles, mouse_y
 import key_input
 import key_output
 import pynput
+from torchvision import models
 
 # ----------------------------------------------------------------------
-# Policy network with softmax on mouse heads (as in the CSGO paper)
+# Stateful LSTM Policy Network (optimised for 224x224 input)
 # ----------------------------------------------------------------------
-class Policy(nn.Module):
-    def __init__(self):
-        super(Policy, self).__init__()
-        self.conv1 = nn.Conv2d(3, 32, 3, 3)
-        self.conv2 = nn.Conv2d(32, 64, 3, 3)
-        self.dropout1 = nn.Dropout(0.25)
-        self.dropout2 = nn.Dropout(0.5)
-        self.fc1 = nn.Linear(7680, 128)
-        self.fc2 = nn.Linear(128, 4 + 23 + 15 + 5)
+class StatefulLSTMPolicy(nn.Module):
+    def __init__(self, lstm_hidden=256, lstm_layers=1):
+        super().__init__()
+        backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
+        self.backbone = backbone.features
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+        for param in self.backbone[-3:].parameters():
+            param.requires_grad = True
+
+        self.feature_dim = 1280 * 7 * 7
+        self.lstm = nn.LSTM(input_size=self.feature_dim, hidden_size=lstm_hidden,
+                            num_layers=lstm_layers, batch_first=True)
+        self.movement_head = nn.Sequential(nn.Linear(lstm_hidden, 4), nn.Sigmoid())
+        self.attack_head = nn.Sequential(nn.Linear(lstm_hidden, 1), nn.Sigmoid())
+        self.jump_head = nn.Sequential(nn.Linear(lstm_hidden, 1), nn.Sigmoid())
+        self.crouch_head = nn.Sequential(nn.Linear(lstm_hidden, 1), nn.Sigmoid())
+        self.saber_head = nn.Sequential(nn.Linear(lstm_hidden, 1), nn.Sigmoid())
+        self.mouse_x_head = nn.Linear(lstm_hidden, len(mouse_x_possibles))
+        self.mouse_y_head = nn.Linear(lstm_hidden, len(mouse_y_possibles))
+
+        self.hidden = None
+
+    def reset_state(self):
+        self.hidden = None
 
     def forward(self, x):
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = torch.max_pool2d(x, 2)
-        x = self.dropout1(x)
-        x = x.view(x.size(0), -1)
-        x = torch.relu(self.fc1(x))
-        x = self.dropout2(x)
-        x = self.fc2(x)
-
-        movement = torch.sigmoid(x[:, 0:4])
-        mouse_x = x[:, 4:27]
-        mouse_y = x[:, 27:42]
-        attack = torch.sigmoid(x[:, 42:43])
-        jump = torch.sigmoid(x[:, 43:44])
-        crouch = torch.sigmoid(x[:, 44:45])
-        saber = torch.sigmoid(x[:, 45:46])
-
+        batch_size = x.size(0)
+        # x already 224x224
+        features = self.backbone(x)
+        features = features.view(batch_size, -1).unsqueeze(1)
+        if self.hidden is None:
+            h0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=x.device)
+            c0 = torch.zeros(self.lstm.num_layers, batch_size, self.lstm.hidden_size, device=x.device)
+            self.hidden = (h0, c0)
+        lstm_out, self.hidden = self.lstm(features, self.hidden)
+        last_out = lstm_out[:, -1, :]
+        movement = self.movement_head(last_out)
+        attack = self.attack_head(last_out)
+        jump = self.jump_head(last_out)
+        crouch = self.crouch_head(last_out)
+        saber = self.saber_head(last_out)
+        mouse_x_logits = self.mouse_x_head(last_out)
+        mouse_y_logits = self.mouse_y_head(last_out)
+        mouse_x = torch.softmax(mouse_x_logits, dim=1)
+        mouse_y = torch.softmax(mouse_y_logits, dim=1)
         return movement, mouse_x, mouse_y, attack, jump, crouch, saber
 
 
@@ -56,16 +75,21 @@ if __name__ == "__main__":
         'd': key_output.d_char,
         'ctrl': key_output.ctrl_char,
         'space': key_output.space_char,
+        'e': key_output.e_char,   # recenter view command
     }
 
     current_keys = set()
     quit_flag = False
     frame_count = 0
-    prev_img = None   # for frame difference debugging
+    prev_img = None
 
     # FPS reporting
     fps_last_time = time.time()
     fps_frame_count = 0
+
+    # Recenter timer
+    last_recenter_time = time.time()
+    RECENTER_INTERVAL = 8.0  # seconds
 
     def on_press(key):
         global quit_flag
@@ -80,7 +104,6 @@ if __name__ == "__main__":
     def execute_actions(movement, mouse_delta_x, mouse_delta_y, attack, jump, crouch, saber):
         global current_keys
 
-        # ---- Deterministic keys (WASD) - threshold 0.5 ----
         keys_to_press = set()
         if movement[0] > 0.5: keys_to_press.add('w')
         if movement[1] > 0.5: keys_to_press.add('a')
@@ -88,18 +111,14 @@ if __name__ == "__main__":
         if movement[3] > 0.5: keys_to_press.add('d')
         if crouch > 0.5: keys_to_press.add('ctrl')
 
-        # Release keys no longer pressed
         for key in current_keys - keys_to_press:
             key_output.ReleaseKey(key_map[key])
-        # Press new keys
         for key in keys_to_press - current_keys:
             key_output.HoldKey(key_map[key])
         current_keys = keys_to_press
 
-        # ---- Mouse movement: use argmax (as in the CSGO paper) ----
         win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, int(mouse_delta_x), int(mouse_delta_y), 0, 0)
 
-        # ---- Binary actions: threshold 0.5 ----
         if attack > 0.5:
             key_output.left_click()
         if jump > 0.5:
@@ -110,10 +129,10 @@ if __name__ == "__main__":
             key_output.ReleaseKey(key_map['space'])
 
     # Initialize policy
-    policy = Policy().cuda()
+    policy = StatefulLSTMPolicy().cuda()
     try:
-        policy.load_state_dict(torch.load('policy_youtube_trained.pth'))
-        print("✅ Loaded trained policy from policy_youtube_trained.pth")
+        policy.load_state_dict(torch.load('policy_lstm_trained.pth'))
+        print("✅ Loaded trained policy from policy_lstm_trained.pth")
     except:
         print("⚠️ No trained weights found, using untrained policy")
     policy.eval()
@@ -127,30 +146,27 @@ if __name__ == "__main__":
     win32gui.SetForegroundWindow(hwin_csgo)
     time.sleep(1)
 
-    # Screen capture using mss
     sct = mss.mss()
-    h, w = csgo_img_dimension
-    print(f"Frame size: {w}x{h}")
-    print("Using deterministic actions (argmax for mouse, threshold 0.5 for keys).")
-    print("Press 'C' to quit")
+    model_input_size = (224, 224)
+    print(f"Model input size: {model_input_size[0]}x{model_input_size[1]}")
+    print("LSTM state persists indefinitely. Press 'C' to quit.")
 
     listener = pynput.keyboard.Listener(on_press=on_press)
     listener.start()
 
-    # Pre‑allocate tensors
-    input_tensor = torch.zeros(1, 3, h, w, device='cuda')
-    frame_buffer = np.zeros((h, w, 3), dtype=np.float32)
+    input_tensor = torch.zeros(1, 3, model_input_size[0], model_input_size[1], device='cuda')
+    frame_buffer = np.zeros((model_input_size[0], model_input_size[1], 3), dtype=np.float32)
 
     # Warmup
-    dummy = torch.randn(1, 3, h, w, device='cuda')
+    dummy = torch.randn(1, 3, model_input_size[0], model_input_size[1], device='cuda')
     with torch.no_grad():
         _ = policy(dummy)
     torch.cuda.synchronize()
 
-    target_fps = 60
+    target_fps = 16
     frame_time = 1.0 / target_fps
 
-    print("\n🎮 Starting game controller...\n")
+    print("\n🎮 Starting game controller at 16 FPS...\n")
 
     with torch.no_grad():
         while not quit_flag:
@@ -164,7 +180,7 @@ if __name__ == "__main__":
             img = sct.grab(monitor)
             img = np.array(img)
             img = img[:, :, :3]
-            img = cv2.resize(img, (w, h))
+            img = cv2.resize(img, model_input_size)
 
             # Frame difference debugging (every 60 frames)
             if prev_img is not None and frame_count % 60 == 0:
@@ -172,7 +188,7 @@ if __name__ == "__main__":
                 print(f"Frame diff: {diff:.2f}")
             prev_img = img.copy()
 
-            # Preprocess
+            # Preprocess and copy to GPU tensor
             np.copyto(frame_buffer, img.astype(np.float32) / 255.0)
             tensor_cpu = torch.from_numpy(frame_buffer).permute(2, 0, 1).unsqueeze(0)
             input_tensor.copy_(tensor_cpu)
@@ -180,7 +196,6 @@ if __name__ == "__main__":
             # Forward pass
             movement, mouse_x, mouse_y, attack, jump, crouch, saber = policy(input_tensor)
 
-            # Mouse: argmax over probabilities
             mouse_x_probs = mouse_x[0].cpu().numpy()
             mouse_y_probs = mouse_y[0].cpu().numpy()
             mouse_x_idx = np.argmax(mouse_x_probs)
@@ -188,14 +203,12 @@ if __name__ == "__main__":
             mouse_delta_x = mouse_x_possibles[mouse_x_idx]
             mouse_delta_y = mouse_y_possibles[mouse_y_idx]
 
-            # Get probabilities for binary actions (already sigmoid)
             movement_probs = movement[0].cpu().numpy()
             attack_prob = attack[0].cpu().numpy()[0]
             jump_prob = jump[0].cpu().numpy()[0]
             crouch_prob = crouch[0].cpu().numpy()[0]
             saber_prob = saber[0].cpu().numpy()[0]
 
-            # Debug every 60 frames
             if frame_count % 60 == 0:
                 print(f"\n--- Frame {frame_count} ---")
                 print(f"Movement probs: {movement_probs.round(2)}")
@@ -203,7 +216,6 @@ if __name__ == "__main__":
                 print(f"Argmax mouse Y: idx={mouse_y_idx}, val={mouse_delta_y:.1f}")
                 print(f"Attack: {attack_prob:.3f}, Jump: {jump_prob:.3f}, Crouch: {crouch_prob:.3f}, Saber: {saber_prob:.3f}")
 
-            # Execute actions deterministically
             execute_actions(
                 movement_probs,
                 mouse_delta_x,
@@ -214,6 +226,15 @@ if __name__ == "__main__":
                 saber_prob
             )
 
+            # Periodic recenter view (press 'e')
+            # now = time.time()
+            # if now - last_recenter_time >= RECENTER_INTERVAL:
+            #     key_output.HoldKey(key_map['e'])
+            #     time.sleep(0.1)
+            #     key_output.ReleaseKey(key_map['e'])
+            #     last_recenter_time = now
+            #     print("  🔄 Recentered view (E)")
+
             # FPS reporting
             now = time.time()
             if now - fps_last_time >= 1.0:
@@ -222,12 +243,10 @@ if __name__ == "__main__":
                 fps_last_time = now
                 fps_frame_count = 0
 
-            # Maintain target FPS
             elapsed = time.time() - start
             if elapsed < frame_time:
                 time.sleep(frame_time - elapsed)
 
-    # Cleanup
     print("Releasing all keys...")
     listener.stop()
     for key in list(current_keys):

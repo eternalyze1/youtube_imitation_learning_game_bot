@@ -1,6 +1,9 @@
 # jka_2026_youtube_pipeline.py
 # Streaming pipeline: download → stream → label → train → delete, one video at a time.
 # Uses decord to stream frames in chunks, never loading the whole video.
+# Trains the stateful LSTM policy using Truncated Backpropagation Through Time (TBPTT) with seq_len=96.
+# Fixed hidden state size mismatch by dropping incomplete last batch.
+# Class weighting is optional (disabled by default).
 
 import torch
 import torch.nn as nn
@@ -14,20 +17,25 @@ import glob
 import yt_dlp
 from decord import VideoReader, cpu
 
-from jka_2026_controller import Policy
+from jka_2026_controller import StatefulLSTMPolicy
 from jka_2026_train_idm import InverseDynamicsModel
 from config import csgo_img_dimension, mouse_x_possibles, mouse_y_possibles
 
 # ─────────────────────────── CONFIG ───────────────────────────
 CHANNEL_URL = "https://www.youtube.com/@JediAcademyLeague/videos"
 VIDEO_DIR = "youtube_videos_tmp"
-TARGET_FPS = 30                # Lower FPS to reduce memory and processing time
+TARGET_FPS = 16
 POLICY_EPOCHS_PER_VIDEO = 1
 POLICY_LR = 0.0001
 BATCH_SIZE = 32
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+SEQ_LEN = 96
+POLICY_INPUT_SIZE = (224, 224)
 
-# ─────────────────────────── STEP 1: GET VIDEO URLS ───────────────────────────
+# Class weighting (set to True to enable, False for standard losses)
+USE_CLASS_WEIGHTS = False
+
+# ─────────────────────────── STEP 1-4 (unchanged) ───────────────────────────
 def get_channel_video_urls(channel_url, max_videos=None):
     print(f"\n{'='*60}\nFetching video list from channel...\n{'='*60}")
     ydl_opts = {'quiet': True, 'extract_flat': True}
@@ -46,11 +54,8 @@ def get_channel_video_urls(channel_url, max_videos=None):
         print(f"Found {len(urls)} videos")
         return urls
 
-# ─────────────────────────── STEP 2: DOWNLOAD ONE VIDEO ───────────────────────────
 def download_video(url, title):
-    """Download a single video, return path. Cleans up leftover files first."""
     os.makedirs(VIDEO_DIR, exist_ok=True)
-    # Remove any existing files in the directory to avoid lock conflicts
     for f in glob.glob(os.path.join(VIDEO_DIR, '*')):
         try:
             os.remove(f)
@@ -64,18 +69,12 @@ def download_video(url, title):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        # Handle extension mismatches
         for ext in ['.webm', '.mkv']:
             filename = filename.replace(ext, '.mp4')
         print(f"Downloaded: {filename}")
         return filename
 
-# ─────────────────────────── STEP 3: STREAM FRAMES (decord chunked) ───────────────────────────
 def stream_frames_fast(video_path, chunk_size=1000, target_fps=TARGET_FPS):
-    """
-    Generator that yields chunks of resized frames.
-    Each chunk: numpy array of shape (chunk_size, H, W, 3) uint8.
-    """
     h, w = csgo_img_dimension
     vr = VideoReader(video_path, ctx=cpu(0))
     src_fps = vr.get_avg_fps()
@@ -84,12 +83,10 @@ def stream_frames_fast(video_path, chunk_size=1000, target_fps=TARGET_FPS):
     target_count = int(duration * target_fps)
     print(f"  Source: {src_fps:.1f} FPS, {duration:.1f}s, {total_frames} frames")
     print(f"  Target: {target_fps} FPS → {target_count} frames")
-    
     step = src_fps / target_fps
     indices = np.arange(0, target_count, 1, dtype=int)
     src_indices = (indices * step).astype(int)
     src_indices = np.clip(src_indices, 0, total_frames - 1)
-    
     for start in range(0, len(src_indices), chunk_size):
         end = min(start + chunk_size, len(src_indices))
         chunk_src = src_indices[start:end]
@@ -100,12 +97,7 @@ def stream_frames_fast(video_path, chunk_size=1000, target_fps=TARGET_FPS):
         yield resized
     del vr
 
-# ─────────────────────────── STEP 4: LABEL A CHUNK WITH IDM ───────────────────────────
 def label_chunk_with_idm(idm, frames, batch_size=64):
-    """
-    Run IDM on consecutive pairs inside a single chunk.
-    Returns list of action dicts for each transition.
-    """
     idm.eval()
     actions = []
     total = len(frames) - 1
@@ -129,19 +121,23 @@ def label_chunk_with_idm(idm, frames, batch_size=64):
                 })
     return actions
 
-# ─────────────────────────── STEP 5: TRAIN POLICY ON A BATCH OF DATA ───────────────────────────
-class OnlineVideoDataset(Dataset):
+# ─────────────────────────── STEP 5: TRAIN POLICY WITH TBPTT ───────────────────────────
+class LSTMVideoDataset(Dataset):
     def __init__(self, frames, actions):
         min_len = min(len(frames), len(actions))
         self.frames = frames[:min_len]
         self.actions = actions[:min_len]
+        self.target_h, self.target_w = POLICY_INPUT_SIZE
     def __len__(self):
         return len(self.frames)
     def __getitem__(self, idx):
-        frame = torch.from_numpy(self.frames[idx]).float().permute(2, 0, 1) / 255.0
+        frame = self.frames[idx]
+        if frame.shape[0] != self.target_h or frame.shape[1] != self.target_w:
+            frame = cv2.resize(frame, (self.target_w, self.target_h))
+        frame_tensor = torch.from_numpy(frame).float().permute(2, 0, 1) / 255.0
         a = self.actions[idx]
         return (
-            frame,
+            frame_tensor,
             torch.tensor(a['movement'], dtype=torch.float32),
             torch.tensor(a['mouse_x_idx'], dtype=torch.long),
             torch.tensor(a['mouse_y_idx'], dtype=torch.long),
@@ -151,77 +147,126 @@ class OnlineVideoDataset(Dataset):
             torch.tensor(a['saber'], dtype=torch.float32),
         )
 
-def train_policy_on_batch(policy, optimizer, frames, actions, epochs=1):
+def train_policy_on_batch(policy, optimizer, frames, actions, seq_len=SEQ_LEN, epochs=1, use_class_weights=USE_CLASS_WEIGHTS):
     """
-    Train policy on a small batch of data (single chunk).
-    Uses the same loss weighting as the original.
+    Train LSTM policy using Truncated Backpropagation Through Time (TBPTT).
+    Splits data into fixed-length sequences (seq_len) and resets hidden state
+    at the start of each sequence. Drops incomplete last batch to keep hidden size consistent.
+    If use_class_weights is False, standard (unweighted) losses are used.
     """
-    if len(frames) < 2:
+    n_frames = len(frames)
+    if n_frames < seq_len:
         return
-    dataset = OnlineVideoDataset(frames, actions)
-    loader = DataLoader(dataset, batch_size=min(BATCH_SIZE, len(frames)), shuffle=True)
-    total_frames = len(actions)
-    
-    # Class weights for this batch
-    mv = np.array([a['movement'] for a in actions])
-    movement_pos_weights = []
-    for ch in range(4):
-        pos = mv[:, ch].sum()
-        pw = (total_frames - pos) / pos if pos > 0 else 1.0
-        movement_pos_weights.append(pw)
-    mpw = torch.tensor(movement_pos_weights, dtype=torch.float32).to(DEVICE)
-    
-    def weighted_movement_bce(pred, target):
-        loss = nn.functional.binary_cross_entropy(pred, target, reduction='none')
-        w = torch.where(target == 1, mpw.unsqueeze(0), torch.ones_like(loss))
-        return (loss * w).mean()
-    
-    def make_pw(key):
-        pos = sum(1 for a in actions if a[key] == 1)
-        return torch.tensor([(total_frames - pos) / pos if pos > 0 else 1.0], dtype=torch.float32).to(DEVICE)
-    
-    attack_pw = make_pw('attack')
-    jump_pw = make_pw('jump')
-    crouch_pw = make_pw('crouch')
-    saber_pw = make_pw('saber')
-    
-    def wbce(pred, target, pw):
-        loss = nn.functional.binary_cross_entropy(pred, target, reduction='none')
-        w = torch.where(target == 1, pw, torch.ones_like(loss))
-        return (loss * w).mean()
-    
-    mouse_x_counts = np.bincount([a['mouse_x_idx'] for a in actions], minlength=23)
-    mx_w = torch.tensor([total_frames / (23 * c) if c > 0 else 1.0 for c in mouse_x_counts], dtype=torch.float32).to(DEVICE)
-    mouse_y_counts = np.bincount([a['mouse_y_idx'] for a in actions], minlength=15)
-    my_w = torch.tensor([total_frames / (15 * c) if c > 0 else 1.0 for c in mouse_y_counts], dtype=torch.float32).to(DEVICE)
-    ce_x = nn.CrossEntropyLoss(weight=mx_w)
-    ce_y = nn.CrossEntropyLoss(weight=my_w)
-    
+
+    # Pad to make divisible by seq_len
+    pad_len = (seq_len - n_frames % seq_len) % seq_len
+    if pad_len > 0:
+        frames = np.pad(frames, ((0, pad_len), (0, 0), (0, 0), (0, 0)), mode='edge')
+        actions = actions + [actions[-1]] * pad_len
+
+    n_sequences = len(frames) // seq_len
+    seq_frames = frames.reshape(n_sequences, seq_len, frames.shape[1], frames.shape[2], frames.shape[3])
+    seq_actions = [actions[i*seq_len:(i+1)*seq_len] for i in range(n_sequences)]
+
+    total_loss = 0
+    n_batches = 0
+
     for epoch in range(epochs):
         policy.train()
-        total_loss = 0
-        n = 0
-        for batch in loader:
-            frame, mv_true, mx_true, my_true, atk_true, jmp_true, crc_true, sab_true = [b.to(DEVICE) for b in batch]
-            mv_pred, mx_pred, my_pred, atk_pred, jmp_pred, crc_pred, sab_pred = policy(frame)
-            loss = (
-                weighted_movement_bce(mv_pred, mv_true) +
-                ce_x(mx_pred, mx_true) +
-                ce_y(my_pred, my_true) +
-                wbce(atk_pred, atk_true.unsqueeze(1), attack_pw) +
-                wbce(jmp_pred, jmp_true.unsqueeze(1), jump_pw) +
-                wbce(crc_pred, crc_true.unsqueeze(1), crouch_pw) +
-                wbce(sab_pred, sab_true.unsqueeze(1), saber_pw)
-            ) / 7
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            n += 1
-        if n > 0:
-            print(f"      Chunk loss: {total_loss/n:.4f}")
+        policy.reset_state()
 
-# ─────────────────────────── MAIN PIPELINE (STREAMING) ───────────────────────────
+        for seq_idx in range(n_sequences):
+            seq_frames_chunk = seq_frames[seq_idx]
+            seq_actions_chunk = seq_actions[seq_idx]
+
+            dataset = LSTMVideoDataset(seq_frames_chunk, seq_actions_chunk)
+            loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, drop_last=True, num_workers=0)
+
+            total_frames_seq = len(seq_actions_chunk)
+
+            # Precompute class weights only if enabled
+            if use_class_weights:
+                mv = np.array([a['movement'] for a in seq_actions_chunk])
+                movement_pos_weights = []
+                for ch in range(4):
+                    pos = mv[:, ch].sum()
+                    pw = (total_frames_seq - pos) / pos if pos > 0 else 1.0
+                    movement_pos_weights.append(pw)
+                mpw = torch.tensor(movement_pos_weights, dtype=torch.float32).to(DEVICE)
+
+                def weighted_movement_bce(pred, target):
+                    loss = nn.functional.binary_cross_entropy(pred, target, reduction='none')
+                    w = torch.where(target == 1, mpw.unsqueeze(0), torch.ones_like(loss))
+                    return (loss * w).mean()
+
+                def make_pw(key):
+                    pos = sum(1 for a in seq_actions_chunk if a[key] == 1)
+                    return torch.tensor([(total_frames_seq - pos) / pos if pos > 0 else 1.0], dtype=torch.float32).to(DEVICE)
+
+                attack_pw = make_pw('attack')
+                jump_pw = make_pw('jump')
+                crouch_pw = make_pw('crouch')
+                saber_pw = make_pw('saber')
+
+                def wbce(pred, target, pw):
+                    loss = nn.functional.binary_cross_entropy(pred, target, reduction='none')
+                    w = torch.where(target == 1, pw, torch.ones_like(loss))
+                    return (loss * w).mean()
+
+                mouse_x_counts = np.bincount([a['mouse_x_idx'] for a in seq_actions_chunk], minlength=23)
+                mx_w = torch.tensor([total_frames_seq / (23 * c) if c > 0 else 1.0 for c in mouse_x_counts], dtype=torch.float32).to(DEVICE)
+                mouse_y_counts = np.bincount([a['mouse_y_idx'] for a in seq_actions_chunk], minlength=15)
+                my_w = torch.tensor([total_frames_seq / (15 * c) if c > 0 else 1.0 for c in mouse_y_counts], dtype=torch.float32).to(DEVICE)
+                ce_x = nn.CrossEntropyLoss(weight=mx_w)
+                ce_y = nn.CrossEntropyLoss(weight=my_w)
+            else:
+                # Standard losses (no weights)
+                bce = nn.BCELoss()
+                ce = nn.CrossEntropyLoss()
+
+            for batch in loader:
+                # Detach hidden state before forward pass to cut graph
+                if policy.hidden is not None:
+                    policy.hidden = (policy.hidden[0].detach(), policy.hidden[1].detach())
+
+                frame, mv_true, mx_true, my_true, atk_true, jmp_true, crc_true, sab_true = [b.to(DEVICE) for b in batch]
+
+                mv_pred, mx_pred, my_pred, atk_pred, jmp_pred, crc_pred, sab_pred = policy(frame)
+
+                if use_class_weights:
+                    loss = (
+                        weighted_movement_bce(mv_pred, mv_true) +
+                        ce_x(mx_pred, mx_true) +
+                        ce_y(my_pred, my_true) +
+                        wbce(atk_pred, atk_true.unsqueeze(1), attack_pw) +
+                        wbce(jmp_pred, jmp_true.unsqueeze(1), jump_pw) +
+                        wbce(crc_pred, crc_true.unsqueeze(1), crouch_pw) +
+                        wbce(sab_pred, sab_true.unsqueeze(1), saber_pw)
+                    ) / 7
+                else:
+                    loss = (
+                        bce(mv_pred, mv_true) +
+                        ce(mx_pred, mx_true) +
+                        ce(my_pred, my_true) +
+                        bce(atk_pred, atk_true.unsqueeze(1)) +
+                        bce(jmp_pred, jmp_true.unsqueeze(1)) +
+                        bce(crc_pred, crc_true.unsqueeze(1)) +
+                        bce(sab_pred, sab_true.unsqueeze(1))
+                    ) / 7
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                total_loss += loss.item()
+                n_batches += 1
+
+        if n_batches > 0:
+            print(f"      Chunk loss (epoch {epoch+1}): {total_loss/n_batches:.4f}")
+
+    policy.reset_state()
+
+# ─────────────────────────── MAIN PIPELINE ───────────────────────────
 def main():
     print(f"Device: {DEVICE}")
     print("\nLoading IDM...")
@@ -230,8 +275,8 @@ def main():
     idm.eval()
     print("IDM ready.")
     
-    policy = Policy().to(DEVICE)
-    policy_path = 'policy_youtube_trained.pth'
+    policy = StatefulLSTMPolicy().to(DEVICE)
+    policy_path = 'policy_lstm_trained.pth'
     try:
         policy.load_state_dict(torch.load(policy_path, map_location=DEVICE))
         print(f"Resumed policy from {policy_path}")
@@ -241,7 +286,7 @@ def main():
     optimizer = optim.Adam(policy.parameters(), lr=POLICY_LR)
     
     video_urls = get_channel_video_urls(CHANNEL_URL)
-    progress_file = 'youtube_pipeline_progress.pkl'
+    progress_file = 'youtube_pipeline_progress_lstm.pkl'
     completed = set()
     if os.path.exists(progress_file):
         with open(progress_file, 'rb') as f:
@@ -268,38 +313,33 @@ def main():
             file_size_mb = os.path.getsize(video_path) / 1e6
             print(f"  File size: {file_size_mb:.0f} MB")
             
-            # Stream, label, and train incrementally
-            print("\n🎬 Streaming frames and training...")
-            frame_buffer = []   # store frames for IDM labeling (need consecutive pairs)
+            print("\n🎬 Streaming frames and training LSTM policy...")
+            frame_buffer = []
             total_actions_processed = 0
             chunk_idx = 0
-            for chunk in stream_frames_fast(video_path, chunk_size=1000, target_fps=TARGET_FPS):
-                # Extend buffer with new chunk
+            for chunk in stream_frames_fast(video_path, chunk_size=500, target_fps=TARGET_FPS):
                 frame_buffer.extend(chunk)
-                # When we have enough frames (e.g., 200), label and train
                 if len(frame_buffer) >= 200:
                     chunk_frames = np.array(frame_buffer[:200])
                     actions = label_chunk_with_idm(idm, chunk_frames)
                     if actions:
-                        train_policy_on_batch(policy, optimizer, chunk_frames, actions, epochs=POLICY_EPOCHS_PER_VIDEO)
+                        train_policy_on_batch(policy, optimizer, chunk_frames, actions, seq_len=SEQ_LEN, epochs=POLICY_EPOCHS_PER_VIDEO, use_class_weights=USE_CLASS_WEIGHTS)
                         total_actions_processed += len(actions)
-                    # Keep last frame for overlap (to preserve continuity)
                     frame_buffer = [frame_buffer[-1]]
                 chunk_idx += 1
                 if chunk_idx % 10 == 0:
                     print(f"    Processed {chunk_idx} chunks, {total_actions_processed} actions so far")
             
-            # Process any remaining frames in buffer
             if len(frame_buffer) > 1:
                 chunk_frames = np.array(frame_buffer)
                 actions = label_chunk_with_idm(idm, chunk_frames)
                 if actions:
-                    train_policy_on_batch(policy, optimizer, chunk_frames, actions, epochs=POLICY_EPOCHS_PER_VIDEO)
+                    train_policy_on_batch(policy, optimizer, chunk_frames, actions, seq_len=SEQ_LEN, epochs=POLICY_EPOCHS_PER_VIDEO, use_class_weights=USE_CLASS_WEIGHTS)
                     total_actions_processed += len(actions)
             
             print(f"  Total actions generated: {total_actions_processed}")
             torch.save(policy.state_dict(), policy_path)
-            print(f"  💾 Saved policy checkpoint")
+            print(f"  💾 Saved policy checkpoint to {policy_path}")
             
             os.remove(video_path)
             print(f"  🗑️  Deleted {video_path}")
@@ -312,7 +352,6 @@ def main():
             print(f"\n  ❌ Error: {e}")
             import traceback
             traceback.print_exc()
-            # Clean up temporary files
             for f in glob.glob(os.path.join(VIDEO_DIR, '*')):
                 try:
                     os.remove(f)
